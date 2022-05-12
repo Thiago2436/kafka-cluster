@@ -1,0 +1,38 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: grafana
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - image: grafana/grafana:master
+          name: grafana
+          env:
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: supersecret
+          ports:
+            - containerPort: 3000
+              name: grafana
+          volumeMounts:
+                - name: config-volume
+                  mountPath: /etc/grafana/provisioning/datasources
+      volumes:
+          - name: config-volume
+            configMap:
+              # Provide the name of the ConfigMap containing the files you want
+              # to add to the container
+              name: grafana-config
+              items:
+              - key: datasource
+                path: default-influxdbsource.yaml
+

@@ -1,0 +1,38 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: influx
+  labels:
+    app: influx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: influx
+  template:
+    metadata:
+      labels:
+        app: influx
+    spec:
+      containers:
+        # see https://hub.docker.com/_/influxdb/ for config options
+        - image: influxdb:1.4.2-alpine
+          name: influx
+          env:
+            - name: INFLUXDB_DB
+              value: forecasts
+            - name: INFLUXDB_USER
+              value: graflux
+            - name: INFLUXDB_USER_PASSWORD
+              value: weatherlove
+          ports:
+            - containerPort: 8086
+              name: influx
+          volumeMounts:
+            - name: influx-persistent-storage
+              mountPath: /var/lib/influxdb
+      volumes:
+        - name: influx-persistent-storage
+          gcePersistentDisk:
+            pdName: influxdisk
+            fsType: ext4
