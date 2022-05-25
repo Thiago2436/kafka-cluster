@@ -10,8 +10,11 @@ data:
     #
     # If you are using Kubernetes 1.7.2 or earlier, please take note of the comments
     # for the kubernetes-cadvisor job; you will need to edit or remove this job.
-
+    
+      rule_files:
+    - '/etc/prometheus/*.rules'
     # Scrape config for API servers.
+    
     #
     # Kubernetes exposes API servers as endpoints to the default/kubernetes
     # service so this uses `endpoints` role and uses relabelling to only keep
