@@ -1,0 +1,496 @@
+Log Kubernetes Statefulsets Using Prometheus + Grafana in EKS Fargate and Enable CI/CD Using Jenkins
+In our previous article, we explored deploying a 2 tier multi container application on EKS Fargate. We explored deploying statefulsets, and exposed our application via AWS ALB Controller.
+
+In this article, we extend our application function to a more production centric environment by enabling logging using Prometheus. We would explore the steps to enable database logging of Postgres database using Prometheus operators. As daemonsets are not supported in EKS Fargate, we would create our own side car container for statefulsets, and scrape the metrics using Prometheus and Grafana. Finally, we would create a CI/CD solution to ship it in minutes!
+
+Unfortunately, EKS on Fargate does not support Prometheus natively, as Fargate only runs on EFS, and Prometheus runs on EBS volumes. Hence, for this tutorial, we would create a new cluster with worker nodes for Prometheus and Kube System. Essentially, we would create fargate profile only for the default namespace where our application is deployed. We would then extend our previous application to deploy a sidecar container for the stateful set metrics scraping.
+
+Overall, the broad steps will be:
+
+Create EKS Fargate cluster with worker nodes in selected namespaces.
+Extend statefulset and deploy postgres operator as a sidecar to scrape database metrics.
+Install and configure Prometheus to scrape our custom sidecar.
+Configure Grafana dashboard to display our database metrics.
+Create CI/CD solution using Jenkins.
+Step 1: Create EKS Fargate Cluster
+Most of the steps are from this AWS blog. Use the below YAML file to create cluster, and modify accordingly:
+
+
+eksctl create cluster -f cluster.yaml
+As we would be using EBS block storage for Prometheus, we need to install and Configure EBS Drivers, and get the Helm charts for Prometheus and Grafana. Follow the below steps:
+
+helm repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+helm repo add kube-state-metrics https://kubernetes.github.io/kube-state-metrics
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add grafana https://grafana.github.io/helm-charts
+helm repo update
+helm upgrade --install aws-ebs-csi-driver \
+    --namespace kube-system \
+    --set enableVolumeScheduling=true \
+    --set enableVolumeResizing=true \
+    --set enableVolumeSnapshot=true \
+    aws-ebs-csi-driver/aws-ebs-csi-driver
+Additionally, for our application, we need AWS Load Balancer Controller for our ingress. Install it from the below steps or follow this blog:
+
+eksctl utils associate-iam-oidc-provider --cluster fargate-prometheus --approve
+curl -o iam_policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.2.0/docs/install/iam_policy.json
+aws iam create-policy \
+   --policy-name AWSLoadBalancerControllerIAMPolicy \
+   --policy-document file://iam_policy.json
+eksctl create iamserviceaccount \
+  --cluster=fargate-prometheus \
+  --namespace=kube-system \
+  --name=aws-load-balancer-controller \
+  --attach-policy-arn=arn:aws:iam::<AWS_ACCOUNT_ID>:policy/AWSLoadBalancerControllerIAMPolicy \
+  --override-existing-serviceaccounts \
+  --approve
+helm repo add eks https://aws.github.io/eks-charts
+kubectl apply -k "github.com/aws/eks-charts/stable/aws-load-balancer-controller//crds?ref=master"
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+    --set clusterName=fargate-prometheus \
+    --set serviceAccount.create=false \
+    --set region=us-west-2 \
+    --set vpcId=<VPC-ID> \
+    --set serviceAccount.name=aws-load-balancer-controller \
+    -n kube-system
+Finally, we would need to create EFS for our application storage. Use the steps below or follow this blog:
+
+vpc_id=$(aws eks describe-cluster \
+    --name fargate-prometheus \
+    --query "cluster.resourcesVpcConfig.vpcId" \
+    --output text)
+cidr_range=$(aws ec2 describe-vpcs \
+    --vpc-ids $vpc_id \
+    --query "Vpcs[].CidrBlock" \
+    --output text)
+security_group_id=$(aws ec2 create-security-group \
+    --group-name MyEfsSecurityGroup \
+    --description "My EFS security group" \
+    --vpc-id $vpc_id \
+    --output text)
+aws ec2 authorize-security-group-ingress \
+    --group-id $security_group_id \
+    --protocol tcp \
+    --port 2049 \
+    --cidr $cidr_range
+file_system_id=$(aws efs create-file-system \
+    --region us-west-2 \
+    --performance-mode generalPurpose \
+    --query 'FileSystemId' \
+    --output text)
+#Get IP address of Nodes and match it with the subnets
+kubectl get nodes
+NAME                                         STATUS   ROLES    AGE   VERSION
+ip-192-168-56-0.region-code.compute.internal   Ready    <none>   19m   v1.19.6-eks-49a6c0
+aws ec2 describe-subnets \
+    --filters "Name=vpc-id,Values=$vpc_id" \
+    --query 'Subnets[*].{SubnetId: SubnetId,AvailabilityZone: AvailabilityZone,CidrBlock: CidrBlock}' \
+    --output table
+#Match the subnets given by output of above command in the IP range of "kubectl get nodes" command. Save that subnet ID and supply it in the below command for mounting to EFS:
+aws efs create-mount-target \
+    --file-system-id $file_system_id \
+    --subnet-id subnet-EXAMPLEe2ba886490 \
+    --security-groups $security_group_id
+#Repeat the above command for all subnets.
+Step 2: Extend statefulset and deploy postgres operator as a sidecar.
+We would be using most of the YAMLs of our previous application deployed from this repo.
+
+Deploy all the YAMLs, except the statefulset, which we will extend to include side car. As the database we are using is postgres, the sidecar we would be using is postgres-exporter. We are using this as it is listed as official postgres exporter in Prometheus website. As you could see from the official page, postgres-exporter uses DATA_SOURCE_NAME as the database URL for scraping. Hence, we would supply this variable in our statefulset secret.
+
+Find below the updated YAMLs that we would be using for monitoring.
+
+
+As you can, in line #10 above, we have added the DATA_SOURCE_NAME variable to enable our sidecar to scrape postgres database.
+
+We now update our statefulset itself, to include the sidecar container:
+
+
+Line #33 to #39 defines our sidecar for monitoring. Make sure to expose it on port 9187 (line #39) to ensure Prometheus picks up the metric.
+
+Finally, to ensure that Prometheus picks up our sidecar metrics, we would need to define an internal service for Prometheus to interact with our sidecar. We define that below:
+
+
+Note that we are again exposing the service on port 9187 for Prometheus to pick up the metrics from the sidecar.
+
+With these extensions done, all we need is to apply everything. Make sure to create PV, PVC, Storage Class, Secrets etc. before applying deployments.
+
+Finally, setup Ingress and (optionally) upgrade it to use TLS by using ACM. All of these steps can be referred from my previous part here.
+
+A final sanity check:
+
+kubectl get all
+NAME                                         READY   STATUS    RESTARTS   AGE
+pod/fullstack-app-postgres-bf57ff694-bjhgh   1/1     Running   0          12m
+pod/fullstack-postgres-0                     2/2     Running   0          14m
+NAME                                     TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)          AGE
+service/fullstack-app-postgres           ClusterIP   10.100.124.112   <none>        8080/TCP         12m
+service/fullstack-app-postgres-sidecar   NodePort    10.100.189.130   <none>        9187:31360/TCP   23m
+service/fullstack-postgres               ClusterIP   10.100.80.163    <none>        5432/TCP         23m
+service/kubernetes                       ClusterIP   10.100.0.1       <none>        443/TCP          3h20m
+NAME                                     READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/fullstack-app-postgres   1/1     1            1           12m
+NAME                                               DESIRED   CURRENT   READY   AGE
+replicaset.apps/fullstack-app-postgres-bf57ff694   1         1         1       12m
+NAME                                  READY   AGE
+statefulset.apps/fullstack-postgres   1/1     14m
+Step 3: Install and configure Prometheus to scrape postgres sidecar container.
+We would configure the prerequisites for Prometheus such as creating namespace and storageclasses. However, before our final installation, we would edit the configuration file (values.yaml) to allow Prometheus to scrape our custom targets, which is our deployed side car service.
+
+Creating namespace and getting AZ of worker nodes:
+
+kubectl create namespace prometheus
+EBS_AZ=$(kubectl get nodes \
+  -o=jsonpath="{.items[0].metadata.labels['topology\.kubernetes\.io\/zone']}")
+Creating Storage class:
+
+echo "
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: prometheus
+  namespace: prometheus
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp2
+reclaimPolicy: Retain
+allowedTopologies:
+- matchLabelExpressions:
+  - key: topology.ebs.csi.aws.com/zone
+    values:
+    - $EBS_AZ
+" | kubectl apply -f -
+To install Prometheus, we would first pull the charts, and modify the values to point towards our sidecar. Pull the charts as below:
+
+wget https://github.com/aws-samples/containers-blog-maelstrom/raw/main/fargate-monitoring/prometheus_values.yml
+Open this file, and go to the very bottom, or wherever you could find the value: “extraScrapeConfigs”. What we would do is edit this file to enable Prometheus to scrape our sidecar. Edit the file and put this configuration for extraScrapeConfigs:
+
+extraScrapeConfigs: |
+  - job_name: 'fullstack-app-postgres-sidecar'
+  static_configs:
+    - targets:
+      - "fullstack-app-postgres-sidecar.default.svc:9187"
+Make sure to put the pipe operator: “|” after extraScrapeConfigs to enable YAML to recognise string. Additionally, make sure indentation is two spaces for each new line (else you would face weird errors). Finally, “fullstack-app-postgres-sidecar.default.svc” means the <servicename>.<namespacename>.svc. This is pattern to access different namespace service. The service name is the same one which is accessing our sidecar container.
+
+Save the file and install the helm charts using following command. Make sure to be in this same directory where you have saved this file (or supply this file path):
+
+helm install prometheus -f prometheus_values.yml \
+  prometheus-community/prometheus --namespace prometheus
+Once the charts are installed, you could verify if Prometheus is installed:
+
+kubectl get pods --namespace prometheus
+NAME                                             READY   STATUS    RESTARTS   AGE
+prometheus-alertmanager-bccd5ffc9-l6hw5          2/2     Running   0          3d4h
+prometheus-kube-state-metrics-5fd8648d78-d2kv6   1/1     Running   0          3d4h
+prometheus-node-exporter-96v92                   1/1     Running   0          3d4h
+prometheus-node-exporter-j57tt                   1/1     Running   0          3d4h
+prometheus-pushgateway-5d7ff8d7f-94wcr           1/1     Running   0          3d4h
+prometheus-server-95ffc4b78-dj6pj                2/2     Running   0          3d4h
+Step 4: Configure Grafana dashboard to display database metrics.
+This step is quite easy, as we would follow the below commands to setup Grafana dashboard. First, we need to verify if our Prometheus is correctly scraping our sidecar container.
+
+In the pods list, prometheus-server is the one that allows us GUI access to internal targets of Prometheus. We would port-forward prometheus server to access it locally:
+
+kubectl port-forward -n prometheus svc/prometheus-server 9090:80
+Why 9090:80? 9090 is the port in which we want to expose locally. 80 is the port of the prometheus-server service which is running in EKS. Once the above command is run, access it locally: http://127.0.0.1:9090/
+
+In the GUI window select Status->Targets. You would see the sidecar status as UP:
+
+
+Another way to verify this is to manually logging into the prometheus server container, and using telnet to check if you are able to access this service.
+
+Run the following command to enter the prometheus-server container manually:
+
+kubectl exec prometheus-server-95ffc4b78-dj6pj -c prometheus-server -n prometheus -it sh
+We are entering the POD name after “exec”, and the container name after “-c”. We can get the container details after describing the prometheus-server pod.
+
+Once inside prometheus-server container, run telnet to the service to check connectivity:
+
+/prometheus $ telnet fullstack-app-postgres-sidecar.default.svc:9187
+Connected to fullstack-app-postgres-sidecar.default.svc:9187
+Now that we have verified that the sidecar is working as expected and Prometheus is able to access it, we simply deploy the Grafana dashboard and see our metrics in rich colourful GUI!
+
+Follow the below straightforward steps:
+
+wget https://raw.githubusercontent.com/aws-samples/containers-blog-maelstrom/main/fargate-monitoring/grafana-values.yaml
+helm install grafana -f grafana-values.yaml \
+  grafana/grafana --namespace prometheus
+Once Grafana is installed, get the loadbalancer URL to access the dashboard:
+
+printf $(kubectl get service grafana \
+  --namespace prometheus \
+  -o jsonpath="{.status.loadBalancer.ingress[].hostname}");echo
+Open the URL in the browser. Login username is “admin”. Password you can get from secrets as below:
+
+kubectl get secret --namespace prometheus grafana \
+ -o jsonpath="{.data.admin-password}" | \
+ base64 --decode ; echo
+Once inside the dashboard, click on + on the left side, and click on “Import”. Then enter the dashboard number as: “9628”. Select the dataset as Prometheus:
+
+
+Once imported, you would start seeing the metrics getting populated in sometime as below:
+
+
+
+Hence, you could effectively monitor your statefulsets database in EKS Fargate using Prometheus and Grafana!
+
+Step 5: Create CI/CD solution using Jenkins
+We finally top off our application by creating a state of the art (not really :P) CI/CD solution using Jenkins! The steps are straightforward, we would first install Jenkins on EC2 instance, then enable Docker Plugin and credentials, connect with our EKS cluster, and finally create a Jenkinsfile which sequentially builds image and deploys image to the cluster.
+
+a) Install Jenkins server:
+Nothing much here, but commands to get the Jenkins server up and running. Follow any guide, or the below commands (i used t2.medium Ubuntu box):
+
+sudo apt update 
+sudo apt install openjdk-8-jdk -y
+wget -q -O - https://pkg.jenkins.io/debian-stable/jenkins.io.key | sudo apt-key add 
+sudo sh -c 'echo deb http://pkg.jenkins.io/debian-stable binary/ > /etc/apt/sources.list.d/jenkins.list' 
+sudo apt update
+sudo apt install jenkins -y
+sudo systemctl start jenkins
+sudo systemctl status jenkins
+Log into the Jenkins server and create your admin user. Then follow the below steps to add Jenkins user as admin. Switch to this user.
+
+sudo vim /etc/sudoers
+## Add below at end of file
+jenkins ALL=(ALL) NOPASSWD: ALL
+## Switch to Jenkins user
+sudo su - jenkins
+b) Install Docker and Kubernetes:
+(Important: make sure to perform all the below steps as Jenkins user)
+
+Install Docker:
+
+sudo apt install docker.io -y
+## Adding Jenkins user to docker group.
+sudo usermod -aG docker jenkins
+Configure AWS CLI and Git:
+
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+aws configure
+// Enter your credentials in the prompt.
+sudo apt-get install git -y
+Install Kubectl. Use the appropriate version of your cluster.
+
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+Install eksctl:
+
+curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+sudo mv /tmp/eksctl /usr/local/bin
+Finally, try to access the EKS cluster we have created using Jenkins username:
+
+
+aws eks update-kubeconfig --name fargate-prometheus
+kubectl get pods
+NAME                                     READY   STATUS    RESTARTS   AGE
+fullstack-app-postgres-bf57ff694-7nwxw   1/1     Running   0          3d1h
+fullstack-postgres-0                     2/2     Running   0          3d1h
+c) Add Credentials
+Install Docker Pipeline plugin which we would use to create and push image.
+
+
+Store the Docker credentials username and password. Go to Credentials->System->Global Credentials, and store the Docker HUB password and note down the variable ID used. This would be used later in the Pipeline.
+
+Note: For security reasons, it is recommended to use Dockerhub personal access token. Additionally, for some reason, if you get login error, make sure not to have any special characters in password.
+
+
+d) Create CI/CD Pipeline
+Finally, we create the pipeline using our pipeline script. Find the steps below:
+
+First, we activate the webhook of Github repository. Go to your github repo where you are storing the code, and on the top you would find settings option. Click on “Add Webhook” in the left side, and enter the Jenkins DNS URL along with the suffix: /github-webhook/. Select “Just the Push event”.
+
+
+Then, Click on New Item, and select Pipeline.
+
+
+Select Github project and enter the Github project URL. Select Build trigger as Github hook trigger for GITScm polling.
+
+
+Finally, in the Jenkinsfile, the file containing our groovy script for pipeline, enter the following details:
+
+
+We are essentially taking the build file from the same (or different) repo. Make sure to specify the repo name. We can store the file locally (in Jenkins GUI) as well.
+
+Finally, take a look at the Jenkinsfile below:
+
+
+As you could infer, we are first using Docker plugin to build our image and tag it with our build ID. We then push this tagged image to our Dockerhub registry using the dockerhub credentials variable (line #15) we created earlier (make sure to use the same variable name as the one created in Jenkins credentials). We finally replace the existing image in the deployment file with our tagged built image (with build ID). We then deploy the file and restart the deployment for the changes to take effect.
+
+To test this, I made the change in line #35 of handlers.go (inside http folder). I changed the output from Well Done :) to Awesome :):
+
+34         fmt.Printf("%s - request with database\n", time.Now().Format(time.ANSIC))
+35         w.Write([]byte("Awesome! :)"))
+On doing the standard git commit:
+
+git add .
+git commit -m "code changes"
+git push origin master
+I could see that the build was automatically triggered, and all changes deployed in the Jenkins output:
+
+Started by GitHub push by gravito
+Obtained Jenkinsfile from git https://github.com/gravito/simpleservice.git
+[Pipeline] Start of Pipeline
+[Pipeline] node
+Running on Jenkins in /var/lib/jenkins/workspace/eks
+[Pipeline] {
+[Pipeline] stage
+[Pipeline] { (Declarative: Checkout SCM)
+[Pipeline] checkout
+Selected Git installation does not exist. Using Default
+The recommended git tool is: NONE
+No credentials specified
+ > git rev-parse --resolve-git-dir /var/lib/jenkins/workspace/eks/.git # timeout=10
+Fetching changes from the remote Git repository
+ > git config remote.origin.url https://github.com/gravito/simpleservice.git # timeout=10
+Fetching upstream changes from https://github.com/gravito/simpleservice.git
+ > git --version # timeout=10
+ > git --version # 'git version 2.34.1'
+ > git fetch --tags --force --progress -- https://github.com/gravito/simpleservice.git +refs/heads/*:refs/remotes/origin/* # timeout=10
+ > git rev-parse refs/remotes/origin/master^{commit} # timeout=10
+Checking out Revision 554bdcbcd0960880cd619f883b2ba1e551465f99 (refs/remotes/origin/master)
+ > git config core.sparsecheckout # timeout=10
+ > git checkout -f 554bdcbcd0960880cd619f883b2ba1e551465f99 # timeout=10
+Commit message: "changed message"
+ > git rev-list --no-walk ed91a24a14f52d0556d6ce321ab3bbe47ccbb459 # timeout=10
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] withEnv
+[Pipeline] {
+[Pipeline] stage
+[Pipeline] { (Build image)
+[Pipeline] script
+[Pipeline] {
+[Pipeline] isUnix
+[Pipeline] withEnv
+[Pipeline] {
+[Pipeline] sh
++ docker build -t gravito/simple-service:7 .
+Sending build context to Docker daemon  11.95MB
+
+Step 1/13 : FROM golang:alpine as builder
+ ---> 155ead2e66ca
+Step 2/13 : LABEL maintainer="Aayush Shrut <aayush.shrut@gmail.com>"
+ ---> Using cache
+ ---> 9eff72ae46ad
+Step 3/13 : WORKDIR /app
+ ---> Using cache
+ ---> b6af9e060344
+Step 4/13 : COPY go.mod go.sum ./
+ ---> Using cache
+ ---> 1c0cca91de31
+Step 5/13 : RUN go mod download
+ ---> Using cache
+ ---> 1f6703e534fa
+Step 6/13 : COPY . .
+ ---> 53f6366f93c2
+Step 7/13 : RUN GO111MODULE=on CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo
+ ---> Running in 7ac4680b5895
+Removing intermediate container 7ac4680b5895
+ ---> 0ce4e8196254
+Step 8/13 : FROM alpine:latest
+ ---> e66264b98777
+Step 9/13 : WORKDIR /root/
+ ---> Using cache
+ ---> 57ec9916b0f4
+Step 10/13 : COPY --from=builder /app/simple-service .
+ ---> 16f7592e1b4b
+Step 11/13 : COPY --from=builder /app/.env .
+ ---> 8878612aa0ba
+Step 12/13 : EXPOSE 8080
+ ---> Running in 0dfc93aa8033
+Removing intermediate container 0dfc93aa8033
+ ---> 8cc961070056
+Step 13/13 : CMD ["./simple-service"]
+ ---> Running in 7c877e5b7a27
+Removing intermediate container 7c877e5b7a27
+ ---> 5e0a9130ab72
+Successfully built 5e0a9130ab72
+Successfully tagged gravito/simple-service:7
+[Pipeline] }
+[Pipeline] // withEnv
+[Pipeline] }
+[Pipeline] // script
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Push image)
+[Pipeline] script
+[Pipeline] {
+[Pipeline] withEnv
+[Pipeline] {
+[Pipeline] withDockerRegistry
+$ docker login -u gravito -p ******** https://registry.hub.docker.com
+
+Login Succeeded
+[Pipeline] {
+[Pipeline] isUnix
+[Pipeline] withEnv
+[Pipeline] {
+[Pipeline] sh
++ docker tag gravito/simple-service:7 registry.hub.docker.com/gravito/simple-service:7
+[Pipeline] }
+[Pipeline] // withEnv
+[Pipeline] isUnix
+[Pipeline] withEnv
+[Pipeline] {
+[Pipeline] sh
++ docker push registry.hub.docker.com/gravito/simple-service:7
+The push refers to repository [registry.hub.docker.com/gravito/simple-service]
+ed84bb285891: Preparing
+8110c973ca20: Preparing
+24302eb7d908: Preparing
+24302eb7d908: Layer already exists
+ed84bb285891: Pushed
+8110c973ca20: Pushed
+7: digest: sha256:8036cd9a88874e175356a97ed51e2c99c0b82b254b88cc481110bc4e5799441e size: 946
+[Pipeline] }
+[Pipeline] // withEnv
+[Pipeline] }
+[Pipeline] // withDockerRegistry
+[Pipeline] }
+[Pipeline] // withEnv
+[Pipeline] }
+[Pipeline] // script
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Deploy to EKS)
+[Pipeline] sh
++ sed -i s/simple-service:latest/simple-service:7/g kubernetes/app-postgres-deployment.yaml
+[Pipeline] sh
++ kubectl apply -f kubernetes/app-postgres-deployment.yaml
+deployment.apps/fullstack-app-postgres configured
+[Pipeline] sh
++ kubectl rollout restart deployment fullstack-app-postgres
+deployment.apps/fullstack-app-postgres restarted
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] }
+[Pipeline] // withEnv
+[Pipeline] }
+[Pipeline] // node
+[Pipeline] End of Pipeline
+Finished: SUCCESS
+Finally, when we try accessing the Ingress, we get our Awesome :) message:
+
+kubectl get ingress
+NAME          CLASS    HOSTS   ADDRESS                                                                 PORTS   AGE
+ingress-app   <none>   *       k8s-default-ingressa-1234567890.us-east-1.elb.amazonaws.com   80      2d15h
+## Use the Ingress URL to access the changed output:
+Awesome :)
+Conclusion
+So this concludes the two part article on EKS Fargate. In the first part, we explored ways to deploy a simple 2-tier frontend-database Go application in EKS Fargate using statefulsets and create custom URL using Ingress and further secured it with TLS.
+
+In this part, we extended our application by including monitoring and CI/CD. We first created a Prometheus and Grafana solution by creating a sidecar proxy to scrape our statefulset or database metrics using Postgres Operators. We then deployed our Prometheus solution to scrape our custom sidecar. We then displayed these metrics using Grafana dashboard.
+
+We finally created a CI/CD solution by installing Jenkins server, and installing Docker plugin. We then created webhooks from our repo, and created the appropriate Jenkinsfile to build and push images to our Docker repo, and also to rollout new deployments in our EKS cluster. We tested these using a simple code change.
+
+EKS Fargate is a wonderful serverless solution for containers, and I could see its increased adoption in Enterprises in years to come. I hope you liked the two part series. Feel free to comment for any suggestions or queries. Your claps and shares would do wonders!
+
+
+
+6
+
+
+1
